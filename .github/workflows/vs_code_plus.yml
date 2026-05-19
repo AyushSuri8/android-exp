@@ -31,7 +31,6 @@ jobs:
             unzip \
             python3
 
-          # Fix KVM permissions immediately
           sudo groupadd -r kvm 2>/dev/null || true
           sudo gpasswd -a $USER kvm
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | \
@@ -40,7 +39,7 @@ jobs:
           sudo udevadm trigger --name-match=kvm
           ls -l /dev/kvm
 
-      # ── 2. Android SDK (fixed folder structure) ───────────────
+      # ── 2. Android SDK ──────────────────────────────────────────
       - name: Install Android SDK
         run: |
           mkdir -p $HOME/android-sdk/cmdline-tools
@@ -65,7 +64,7 @@ jobs:
             "platforms;android-35" \
             "system-images;android-35;google_apis;x86_64"
 
-      # ── 4. Create AVD (robust path discovery + symlink) ─────────
+      # ── 4. Create AVD (do not auto-start; path will be checked manually) ─
       - name: Create AVD
         run: |
           mkdir -p ~/.android/avd
@@ -74,24 +73,7 @@ jobs:
             -k "system-images;android-35;google_apis;x86_64" \
             -d 9 \
             --force
-
-          # Robust discovery: find the actual Pixel35.ini file
-          AVD_INI=$(find ~ -name "Pixel35.ini" 2>/dev/null | head -n1)
-          if [ -z "$AVD_INI" ]; then
-            echo "ERROR: AVD Pixel35 was not created"
-            exit 1
-          fi
-          
-          # Pixel35.ini lives inside Pixel35.avd/; get the parent avd folder
-          REAL_AVD_HOME=$(dirname "$(dirname "$AVD_INI")")
-          
-          # Symlink it to the standard location so emulator always finds it
-          rm -rf ~/.android/avd
-          ln -s "$REAL_AVD_HOME" ~/.android/avd
-          
-          echo "ANDROID_AVD_HOME=$HOME/.android/avd" >> $GITHUB_ENV
-          echo "Resolved real AVD path: $REAL_AVD_HOME"
-          emulator -list-avds
+          echo "AVD created. Start it manually inside noVNC/VS Code terminal."
 
       # ── 5. Start XFCE + VNC + noVNC ─────────────────────────────
       - name: Start desktop and VNC
@@ -104,7 +86,7 @@ jobs:
           x11vnc -display :1 -forever -nopw -shared &
           websockify --web=/usr/share/novnc/ 6080 localhost:5900 &
 
-      # ── 6. Install VS Code Server (browser IDE) ───────────────────
+      # ── 6. Install VS Code Server ───────────────────────────────
       - name: Install code-server
         run: |
           cd /tmp
@@ -124,26 +106,7 @@ jobs:
           sleep 5
           echo "VS Code Server running on http://localhost:8080"
 
-      # ── 7. Start Android Emulator ───────────────────────────────
-      - name: Start Android Emulator
-        run: |
-          export DISPLAY=:1
-          export ANDROID_AVD_HOME=$ANDROID_AVD_HOME
-
-          newgrp kvm <<'EOF'
-            emulator @Pixel35 \
-              -gpu swiftshader_indirect \
-              -noaudio \
-              -no-boot-anim \
-              -no-snapshot \
-              -no-metrics &
-          EOF
-
-          adb wait-for-device
-          adb devices
-          adb tcpip 5555
-
-      # ── 8. Start APK / Metro receiver ───────────────────────────
+      # ── 7. Start APK / Metro receiver ───────────────────────────
       - name: Start APK and Metro receiver
         run: |
           cat > /tmp/receiver.py <<'PY'
@@ -217,35 +180,32 @@ jobs:
           python3 /tmp/receiver.py &
           echo "Receiver running on port 9000"
 
-      # ── 9. Cloudflare Tunnels (noVNC + VS Code + receiver) ──────
+      # ── 8. Cloudflare Tunnels (noVNC + VS Code + receiver) ──────
       - name: Expose via Cloudflare Tunnel
         run: |
           cd /tmp
           wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
           sudo dpkg -i cloudflared-linux-amd64.deb 2>/dev/null || true
 
-          # Tunnel 1: noVNC (browser desktop)
           cloudflared tunnel --url http://localhost:6080 > /tmp/tunnel_vnc.log 2>&1 &
           sleep 15
           VNC_URL=$(grep -oE 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' /tmp/tunnel_vnc.log | head -n1)
           echo "=== noVNC URL (browser desktop) ==="
           echo "$VNC_URL"
 
-          # Tunnel 2: VS Code Server (browser IDE)
           cloudflared tunnel --url http://localhost:8080 > /tmp/tunnel_code.log 2>&1 &
           sleep 15
           CODE_URL=$(grep -oE 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' /tmp/tunnel_code.log | head -n1)
           echo "=== VS CODE URL (browser IDE) ==="
           echo "$CODE_URL"
 
-          # Tunnel 3: APK / Metro receiver (send builds here)
           cloudflared tunnel --url http://localhost:9000 > /tmp/tunnel_apk.log 2>&1 &
           sleep 15
           APK_URL=$(grep -oE 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' /tmp/tunnel_apk.log | head -n1)
           echo "=== APK / METRO UPLOAD URL ==="
           echo "$APK_URL"
 
-      # ── 10. Keep alive until 6h limit ───────────────────────────
+      # ── 9. Keep alive until 6h limit ───────────────────────────
       - name: Keep Alive
         run: |
           echo "Runner is live. Waiting for 6h timeout..."
