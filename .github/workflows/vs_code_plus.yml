@@ -1,0 +1,244 @@
+name: Android Cloud Emulator + VS Code
+
+on:
+  workflow_dispatch:
+
+jobs:
+  emulator:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ── 1. System dependencies + KVM ────────────────────────────
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            qemu-kvm \
+            xfce4 \
+            xfce4-goodies \
+            xvfb \
+            x11vnc \
+            novnc \
+            websockify \
+            mesa-utils \
+            adb \
+            wget \
+            curl \
+            unzip \
+            python3
+
+          # Fix KVM permissions immediately
+          sudo groupadd -r kvm 2>/dev/null || true
+          sudo gpasswd -a $USER kvm
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | \
+            sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          ls -l /dev/kvm
+
+      # ── 2. Android SDK (fixed folder structure) ───────────────
+      - name: Install Android SDK
+        run: |
+          mkdir -p $HOME/android-sdk/cmdline-tools
+          cd $HOME/android-sdk/cmdline-tools
+          wget -q https://dl.google.com/android/repository/commandlinetools-linux-13114758_latest.zip
+          unzip -q commandlinetools-linux-13114758_latest.zip
+          mv cmdline-tools latest
+
+          echo "ANDROID_HOME=$HOME/android-sdk" >> $GITHUB_ENV
+          echo "ANDROID_SDK_ROOT=$HOME/android-sdk" >> $GITHUB_ENV
+          echo "$HOME/android-sdk/cmdline-tools/latest/bin" >> $GITHUB_PATH
+          echo "$HOME/android-sdk/platform-tools" >> $GITHUB_PATH
+          echo "$HOME/android-sdk/emulator" >> $GITHUB_PATH
+
+      # ── 3. Emulator packages ────────────────────────────────────
+      - name: Install emulator packages
+        run: |
+          yes | sdkmanager --licenses >/dev/null 2>&1 || true
+          sdkmanager \
+            "platform-tools" \
+            "emulator" \
+            "platforms;android-35" \
+            "system-images;android-35;google_apis;x86_64"
+
+      # ── 4. Create AVD (numeric device id + path discovery) ──────
+      - name: Create AVD
+        run: |
+          mkdir -p ~/.android/avd
+          echo "no" | avdmanager create avd \
+            -n Pixel35 \
+            -k "system-images;android-35;google_apis;x86_64" \
+            -d 9 \
+            --force
+
+          AVD_HOME=$(find ~ -type d -name avd | grep '\.android/avd$' | head -n1)
+          echo "ANDROID_AVD_HOME=$AVD_HOME" >> $GITHUB_ENV
+          echo "Discovered AVD_HOME: $AVD_HOME"
+          emulator -list-avds
+
+      # ── 5. Start XFCE + VNC + noVNC ───────────────────────────────
+      - name: Start desktop and VNC
+        run: |
+          export DISPLAY=:1
+          Xvfb :1 -screen 0 1280x720x24 &
+          sleep 2
+          startxfce4 &
+          sleep 5
+          x11vnc -display :1 -forever -nopw -shared &
+          websockify --web=/usr/share/novnc/ 6080 localhost:5900 &
+
+      # ── 6. Install VS Code Server (browser IDE) ───────────────────
+      - name: Install code-server
+        run: |
+          cd /tmp
+          # Fetch latest stable code-server release
+          VER=$(curl -s https://api.github.com/repos/coder/code-server/releases/latest | grep tag_name | cut -d '"' -f 4)
+          wget -q "https://github.com/coder/code-server/releases/download/${VER}/code-server-${VER#v}-linux-amd64.tar.gz"
+          tar -xzf code-server-*-linux-amd64.tar.gz
+          sudo mv code-server-*-linux-amd64/bin/code-server /usr/local/bin/
+          mkdir -p $HOME/.config/code-server
+
+          # Config: no auth password (we rely on random Cloudflare URL), bind localhost
+          cat > $HOME/.config/code-server/config.yaml <<'EOF'
+          bind-addr: 127.0.0.1:8080
+          auth: none
+          cert: false
+          EOF
+
+          # Start code-server in background
+          code-server --config $HOME/.config/code-server/config.yaml &
+          sleep 5
+          echo "VS Code Server running on http://localhost:8080"
+
+      # ── 7. Start Android Emulator ───────────────────────────────
+      - name: Start Android Emulator
+        run: |
+          export DISPLAY=:1
+          export ANDROID_AVD_HOME=$ANDROID_AVD_HOME
+
+          newgrp kvm <<'EOF'
+            emulator @Pixel35 \
+              -gpu swiftshader_indirect \
+              -noaudio \
+              -no-boot-anim \
+              -no-snapshot \
+              -no-metrics &
+          EOF
+
+          adb wait-for-device
+          adb devices
+          adb tcpip 5555
+
+      # ── 8. Start APK / Metro receiver ───────────────────────────
+      - name: Start APK and Metro receiver
+        run: |
+          cat > /tmp/receiver.py <<'PY'
+          from http.server import BaseHTTPRequestHandler, HTTPServer
+          import subprocess, urllib.parse
+
+          PORT = 9000
+
+          class Handler(BaseHTTPRequestHandler):
+              def do_POST(self):
+                  length = int(self.headers.get('Content-Length', 0))
+                  data = self.rfile.read(length)
+
+                  if self.path == '/upload':
+                      apk = '/tmp/uploaded.apk'
+                      with open(apk, 'wb') as f:
+                          f.write(data)
+                      self.send_response(200)
+                      self.end_headers()
+                      self.wfile.write(b'APK received. Installing...\n')
+                      r = subprocess.run(
+                          ['adb', 'install', '-r', '-d', apk],
+                          capture_output=True, text=True
+                      )
+                      self.wfile.write(r.stdout.encode() + r.stderr.encode())
+
+                  elif self.path == '/metro':
+                      body = data.decode()
+                      params = urllib.parse.parse_qs(body)
+                      url = params.get('url', [''])[0]
+                      self.send_response(200)
+                      self.end_headers()
+                      self.wfile.write(f'Raw URL: {url}\n'.encode())
+
+                      if url:
+                          exp_url = url.replace('https://', 'exp+')
+                          r1 = subprocess.run([
+                              'adb', 'shell', 'am', 'start',
+                              '-a', 'android.intent.action.VIEW',
+                              '-d', exp_url,
+                              'host.exp.exponent'
+                          ], capture_output=True, text=True)
+                          self.wfile.write(b'Method 1 (exp+): ' + r1.stdout.encode() + r1.stderr.encode())
+
+                          if 'Error' in r1.stderr:
+                              r2 = subprocess.run([
+                                  'adb', 'shell', 'am', 'start',
+                                  '-a', 'android.intent.action.VIEW',
+                                  '-d', url,
+                                  'host.exp.exponent'
+                              ], capture_output=True, text=True)
+                              self.wfile.write(b'Method 2 (https): ' + r2.stdout.encode() + r2.stderr.encode())
+
+                              if 'Error' in r2.stderr:
+                                  r3 = subprocess.run([
+                                      'adb', 'shell', 'am', 'start',
+                                      '-a', 'android.intent.action.VIEW',
+                                      '-d', url,
+                                      'com.android.chrome'
+                                  ], capture_output=True, text=True)
+                                  self.wfile.write(b'Method 3 (Chrome): ' + r3.stdout.encode() + r3.stderr.encode())
+                  else:
+                      self.send_error(404)
+
+              def log_message(self, format, *args):
+                  pass
+
+          HTTPServer(('', PORT), Handler).serve_forever()
+          PY
+
+          python3 /tmp/receiver.py &
+          echo "Receiver running on port 9000"
+
+      # ── 9. Cloudflare Tunnels (noVNC + VS Code + receiver) ──────
+      - name: Expose via Cloudflare Tunnel
+        run: |
+          cd /tmp
+          wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
+          sudo dpkg -i cloudflared-linux-amd64.deb 2>/dev/null || true
+
+          # Tunnel 1: noVNC (browser desktop)
+          cloudflared tunnel --url http://localhost:6080 > /tmp/tunnel_vnc.log 2>&1 &
+          sleep 15
+          VNC_URL=$(grep -oE 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' /tmp/tunnel_vnc.log | head -n1)
+          echo "=== noVNC URL (browser desktop) ==="
+          echo "$VNC_URL"
+
+          # Tunnel 2: VS Code Server (browser IDE)
+          cloudflared tunnel --url http://localhost:8080 > /tmp/tunnel_code.log 2>&1 &
+          sleep 15
+          CODE_URL=$(grep -oE 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' /tmp/tunnel_code.log | head -n1)
+          echo "=== VS CODE URL (browser IDE) ==="
+          echo "$CODE_URL"
+
+          # Tunnel 3: APK / Metro receiver (send builds here)
+          cloudflared tunnel --url http://localhost:9000 > /tmp/tunnel_apk.log 2>&1 &
+          sleep 15
+          APK_URL=$(grep -oE 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' /tmp/tunnel_apk.log | head -n1)
+          echo "=== APK / METRO UPLOAD URL ==="
+          echo "$APK_URL"
+
+      # ── 10. Keep alive until 6h limit ───────────────────────────
+      - name: Keep Alive
+        run: |
+          echo "Runner is live. Waiting for 6h timeout..."
+          while true; do
+            sleep 60
+          done
