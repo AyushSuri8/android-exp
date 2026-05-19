@@ -1,1 +1,251 @@
+name: Android Cloud Emulator + VS Code
 
+on:
+  workflow_dispatch:
+
+jobs:
+  emulator:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ── 1. System dependencies + KVM ────────────────────────────
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            qemu-kvm \
+            xfce4 \
+            xfce4-goodies \
+            xvfb \
+            x11vnc \
+            novnc \
+            websockify \
+            mesa-utils \
+            adb \
+            wget \
+            curl \
+            unzip \
+            python3
+
+          sudo groupadd -r kvm 2>/dev/null || true
+          sudo gpasswd -a $USER kvm
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | \
+            sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          ls -l /dev/kvm
+
+      # ── 2. Android SDK ──────────────────────────────────────────
+      - name: Install Android SDK
+        run: |
+          mkdir -p $HOME/android-sdk/cmdline-tools
+          cd $HOME/android-sdk/cmdline-tools
+          wget -q https://dl.google.com/android/repository/commandlinetools-linux-13114758_latest.zip
+          unzip -q commandlinetools-linux-13114758_latest.zip
+          mv cmdline-tools latest
+
+          echo "ANDROID_HOME=$HOME/android-sdk" >> $GITHUB_ENV
+          echo "ANDROID_SDK_ROOT=$HOME/android-sdk" >> $GITHUB_ENV
+          echo "$HOME/android-sdk/cmdline-tools/latest/bin" >> $GITHUB_PATH
+          echo "$HOME/android-sdk/platform-tools" >> $GITHUB_PATH
+          echo "$HOME/android-sdk/emulator" >> $GITHUB_PATH
+
+      # ── 3. Emulator packages ────────────────────────────────────
+      - name: Install emulator packages
+        run: |
+          yes | sdkmanager --licenses >/dev/null 2>&1 || true
+          sdkmanager \
+            "platform-tools" \
+            "emulator" \
+            "platforms;android-35" \
+            "system-images;android-35;google_apis;x86_64"
+
+      # ── 4. Create AVD (manual start only) ───────────────────────
+      - name: Create AVD
+        run: |
+          mkdir -p ~/.android/avd
+          echo "no" | avdmanager create avd \
+            -n Pixel35 \
+            -k "system-images;android-35;google_apis;x86_64" \
+            -d 9 \
+            --force
+          echo ""
+          echo "=== AVD CREATED ==="
+          echo "To start emulator manually inside noVNC/VS Code terminal:"
+          echo "  find ~ -name Pixel35.ini"
+          echo "  export ANDROID_AVD_HOME=/path/to/the/.android/avd  (from above)"
+          echo "  export DISPLAY=:1"
+          echo "  emulator @Pixel35 -gpu swiftshader_indirect -noaudio -no-boot-anim -no-snapshot"
+
+      # ── 5. Start XFCE + VNC + noVNC ─────────────────────────────
+      - name: Start desktop and VNC
+        run: |
+          export DISPLAY=:1
+          Xvfb :1 -screen 0 1280x720x24 &
+          sleep 2
+          startxfce4 &
+          sleep 5
+          x11vnc -display :1 -forever -nopw -shared &
+          websockify --web=/usr/share/novnc/ 6080 localhost:5900 &
+
+      # ── 6. Install VS Code Server ───────────────────────────────
+      - name: Install code-server
+        run: |
+          cd /tmp
+          rm -rf code-server* 2>/dev/null || true
+          VER=$(curl -s https://api.github.com/repos/coder/code-server/releases/latest | grep tag_name | cut -d '"' -f 4)
+          TAR="code-server-${VER#v}-linux-amd64.tar.gz"
+          wget -q "https://github.com/coder/code-server/releases/download/${VER}/${TAR}"
+          tar -xzf "${TAR}"
+          DIR="code-server-${VER#v}-linux-amd64"
+          sudo cp "${DIR}/bin/code-server" /usr/local/bin/
+          mkdir -p $HOME/.config/code-server
+          cat > $HOME/.config/code-server/config.yaml <<'EOF'
+          bind-addr: 127.0.0.1:8080
+          auth: none
+          cert: false
+          EOF
+          code-server --config $HOME/.config/code-server/config.yaml &
+          sleep 5
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:8080)
+          echo "code-server health check: HTTP $STATUS"
+
+      # ── 7. Start APK / Metro / Command receiver ─────────────────
+      - name: Start receiver server
+        run: |
+          cat > /tmp/receiver.py <<'PYEOF'
+          from http.server import BaseHTTPRequestHandler, HTTPServer
+          import subprocess, urllib.parse, os
+
+          PORT = 9000
+
+          class Handler(BaseHTTPRequestHandler):
+              def do_POST(self):
+                  length = int(self.headers.get('Content-Length', 0))
+                  data = self.rfile.read(length)
+
+                  if self.path == '/upload':
+                      apk = '/tmp/uploaded.apk'
+                      with open(apk, 'wb') as f:
+                          f.write(data)
+                      self.send_response(200)
+                      self.end_headers()
+                      self.wfile.write(b'APK received. Installing...\n')
+                      r = subprocess.run(
+                          ['adb', 'install', '-r', '-d', apk],
+                          capture_output=True, text=True
+                      )
+                      self.wfile.write(r.stdout.encode() + r.stderr.encode())
+
+                  elif self.path == '/metro':
+                      body = data.decode()
+                      params = urllib.parse.parse_qs(body)
+                      url = params.get('url', [''])[0]
+                      self.send_response(200)
+                      self.end_headers()
+                      self.wfile.write(f'URL: {url}\n'.encode())
+                      if url:
+                          exp_url = url.replace('https://', 'exp+')
+                          r = subprocess.run([
+                              'adb', 'shell', 'am', 'start',
+                              '-a', 'android.intent.action.VIEW',
+                              '-d', exp_url,
+                              'host.exp.exponent'
+                          ], capture_output=True, text=True)
+                          self.wfile.write(r.stdout.encode() + r.stderr.encode())
+
+                  elif self.path == '/cmd':
+                      body = data.decode()
+                      params = urllib.parse.parse_qs(body)
+                      cmd = params.get('cmd', [''])[0]
+                      self.send_response(200)
+                      self.end_headers()
+                      if cmd:
+                          args = ['adb'] + cmd.split()
+                          r = subprocess.run(args, capture_output=True, text=True, timeout=30)
+                          self.wfile.write(r.stdout.encode() + r.stderr.encode())
+                      else:
+                          self.wfile.write(b'Usage: cmd=shell+pm+list+packages\n')
+
+                  elif self.path == '/config':
+                      body = data.decode()
+                      params = urllib.parse.parse_qs(body)
+                      url = params.get('logurl', [''])[0]
+                      self.send_response(200)
+                      self.end_headers()
+                      with open('/tmp/logpush_url.txt', 'w') as f:
+                          f.write(url)
+                      self.wfile.write(f'Log push URL set to: {url}\n'.encode())
+
+                  else:
+                      self.send_error(404)
+
+              def do_GET(self):
+                  if self.path == '/health':
+                      self.send_response(200)
+                      self.end_headers()
+                      self.wfile.write(b'ok')
+                  elif self.path.startswith('/logs'):
+                      parsed = urllib.parse.urlparse(self.path)
+                      qs = urllib.parse.parse_qs(parsed.query)
+                      n = int(qs.get('n', ['100'])[0])
+                      self.send_response(200)
+                      self.end_headers()
+                      if os.path.exists('/tmp/android.log'):
+                          r = subprocess.run(
+                              ['tail', '-n', str(n), '/tmp/android.log'],
+                              capture_output=True, text=True
+                          )
+                          self.wfile.write(r.stdout.encode())
+                      else:
+                          self.wfile.write(b'No logs yet.\n')
+                  else:
+                      self.send_error(404)
+
+              def log_message(self, format, *args):
+                  pass
+
+          HTTPServer(('', PORT), Handler).serve_forever()
+          PYEOF
+
+          python3 /tmp/receiver.py &
+          sleep 2
+          curl -s -o /dev/null -w "%{http_code}" http://localhost:9000/health
+          echo " receiver started"
+
+      # ── 8. Cloudflare Tunnels ───────────────────────────────────
+      - name: Expose via Cloudflare Tunnel
+        run: |
+          cd /tmp
+          wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
+          sudo dpkg -i cloudflared-linux-amd64.deb 2>/dev/null || true
+
+          cloudflared tunnel --url http://localhost:6080 > /tmp/tunnel_vnc.log 2>&1 &
+          sleep 15
+          VNC_URL=$(grep -oE 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' /tmp/tunnel_vnc.log | head -n1)
+          echo "=== noVNC URL ==="
+          echo "$VNC_URL"
+
+          cloudflared tunnel --url http://localhost:8080 > /tmp/tunnel_code.log 2>&1 &
+          sleep 15
+          CODE_URL=$(grep -oE 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' /tmp/tunnel_code.log | head -n1)
+          echo "=== VS CODE URL ==="
+          echo "$CODE_URL"
+
+          cloudflared tunnel --url http://localhost:9000 > /tmp/tunnel_apk.log 2>&1 &
+          sleep 15
+          APK_URL=$(grep -oE 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' /tmp/tunnel_apk.log | head -n1)
+          echo "=== APK / METRO / CMD URL ==="
+          echo "$APK_URL"
+
+      # ── 9. Keep alive until 6h limit ───────────────────────────
+      - name: Keep Alive
+        run: |
+          echo "Runner is live. Waiting for 6h timeout..."
+          while true; do
+            sleep 60
+          done
