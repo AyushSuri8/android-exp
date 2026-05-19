@@ -1,4 +1,3 @@
-```yaml
 name: Android Cloud Emulator
 
 on:
@@ -125,4 +124,3 @@ jobs:
           while true; do
             sleep 60
           done
-```
