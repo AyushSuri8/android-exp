@@ -1,10 +1,10 @@
-name: Android Cloud Emulator
+name: Cloud Android VPS
 
 on:
   workflow_dispatch:
 
 jobs:
-  emulator:
+  cloud-vps:
     runs-on: ubuntu-latest
     timeout-minutes: 360
 
@@ -12,7 +12,11 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install desktop + VNC
+      # ------------------------------------------------
+      # SYSTEM SETUP
+      # ------------------------------------------------
+
+      - name: Install desktop
         run: |
           sudo apt update
 
@@ -23,67 +27,49 @@ jobs:
             x11vnc \
             novnc \
             websockify \
-            qemu-kvm \
-            mesa-utils \
-            adb \
             wget \
             curl \
-            unzip
+            unzip \
+            git \
+            htop \
+            nano \
+            neofetch \
+            net-tools
 
-      - name: Install Android SDK
-        run: |
-          mkdir -p $HOME/android-sdk/cmdline-tools
-          cd $HOME/android-sdk
+      # ------------------------------------------------
+      # START DESKTOP
+      # ------------------------------------------------
 
-          wget https://dl.google.com/android/repository/commandlinetools-linux-13114758_latest.zip
-
-          unzip commandlinetools-linux-*.zip
-
-          mkdir -p cmdline-tools/latest
-
-          mv cmdline-tools/* cmdline-tools/latest/ || true
-
-          echo "ANDROID_HOME=$HOME/android-sdk" >> $GITHUB_ENV
-          echo "ANDROID_SDK_ROOT=$HOME/android-sdk" >> $GITHUB_ENV
-          echo "$HOME/android-sdk/cmdline-tools/latest/bin" >> $GITHUB_PATH
-          echo "$HOME/android-sdk/platform-tools" >> $GITHUB_PATH
-          echo "$HOME/android-sdk/emulator" >> $GITHUB_PATH
-
-      - name: Install Android Emulator
-        run: |
-          yes | sdkmanager --licenses
-
-          sdkmanager \
-            "platform-tools" \
-            "emulator" \
-            "platforms;android-35" \
-            "system-images;android-35;google_apis;x86_64"
-
-      - name: Create AVD
-        run: |
-          echo "no" | avdmanager create avd \
-            -n Pixel35 \
-            -k "system-images;android-35;google_apis;x86_64"
-
-      - name: Start Desktop
+      - name: Start virtual desktop
         run: |
           export DISPLAY=:1
 
-          Xvfb :1 -screen 0 1280x720x24 &
+          Xvfb :1 -screen 0 1920x1080x24 &
+
+          sleep 2
 
           startxfce4 &
 
           sleep 10
 
-      - name: Start VNC
+      # ------------------------------------------------
+      # START VNC
+      # ------------------------------------------------
+
+      - name: Start VNC server
         run: |
           export DISPLAY=:1
 
           x11vnc \
             -display :1 \
             -forever \
+            -shared \
             -nopw \
-            -shared &
+            -listen localhost &
+
+      # ------------------------------------------------
+      # START NOVNC
+      # ------------------------------------------------
 
       - name: Start noVNC
         run: |
@@ -91,36 +77,53 @@ jobs:
             --web=/usr/share/novnc/ \
             6080 localhost:5900 &
 
-      - name: Start Android Emulator
-        run: |
-          export DISPLAY=:1
+      # ------------------------------------------------
+      # INSTALL CLOUDFLARE TUNNEL
+      # ------------------------------------------------
 
-          emulator -avd Pixel35 \
-            -gpu swiftshader_indirect \
-            -noaudio \
-            -no-boot-anim \
-            -no-snapshot &
-
-          adb wait-for-device
-
-          adb devices
-
-      - name: Install Cloudflare Tunnel
+      - name: Install cloudflared
         run: |
           wget https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
 
           sudo dpkg -i cloudflared-linux-amd64.deb
 
-      - name: Expose noVNC
+      # ------------------------------------------------
+      # EXPOSE DESKTOP
+      # ------------------------------------------------
+
+      - name: Expose noVNC publicly
         run: |
-          cloudflared tunnel --url http://localhost:6080 > tunnel.log 2>&1 &
+          cloudflared tunnel \
+            --url http://localhost:6080 \
+            > novnc.log 2>&1 &
 
           sleep 15
 
-          cat tunnel.log
+          echo "=============================="
+          echo "OPEN THIS URL IN BROWSER:"
+          echo "=============================="
 
-      - name: Keep Alive
+          grep -o 'https://[-a-zA-Z0-9]*\.trycloudflare.com' novnc.log
+
+          echo "=============================="
+
+      # ------------------------------------------------
+      # OPTIONAL SSH ACCESS
+      # ------------------------------------------------
+
+      - name: Install Tailscale
         run: |
+          curl -fsSL https://tailscale.com/install.sh | sh
+
+      # ------------------------------------------------
+      # KEEP MACHINE ALIVE
+      # ------------------------------------------------
+
+      - name: Keep runner alive
+        run: |
+          echo "Machine is now acting like temporary VPS"
+
           while true; do
+            echo "still alive $(date)"
             sleep 60
           done
