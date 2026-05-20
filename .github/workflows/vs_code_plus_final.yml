@@ -101,19 +101,24 @@ jobs:
           TAR="code-server-${VER#v}-linux-amd64.tar.gz"
           wget -q "https://github.com/coder/code-server/releases/download/${VER}/${TAR}"
           tar -xzf "${TAR}"
-          DIR="code-server-${VER#v}-linux-amd64"
-          sudo cp "${DIR}/bin/code-server" /usr/local/bin/
+
+          # Move the entire bundle so the relative lib/node path stays intact
+          sudo rm -rf /usr/local/lib/code-server 2>/dev/null || true
+          sudo mv "code-server-${VER#v}-linux-amd64" /usr/local/lib/code-server
+          sudo ln -sf /usr/local/lib/code-server/bin/code-server /usr/local/bin/code-server
+
           mkdir -p $HOME/.config/code-server
           cat > $HOME/.config/code-server/config.yaml <<'EOF'
           bind-addr: 127.0.0.1:8080
           auth: none
           cert: false
           EOF
+
           code-server --config $HOME/.config/code-server/config.yaml &
           sleep 5
           STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:8080)
           echo "code-server health check: HTTP $STATUS"
-
+          
       # ── 7. Start APK / Metro / Command receiver ─────────────────
       - name: Start receiver server
         run: |
